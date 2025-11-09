@@ -20,6 +20,12 @@ node_modules/
 # Testing
 /coverage
 
+*.env
+.env
+frontend/.env
+backend/.env
+
+
 # Next.js
 /.next/
 /out/
