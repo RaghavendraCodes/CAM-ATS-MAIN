@@ -1,0 +1,185 @@
+/* Custom styles for CAM ATS */
+.App {
+  min-height: 100vh;
+}
+
+/* Alert animation */
+@keyframes alertPulse {
+  0% { opacity: 0.8; }
+  50% { opacity: 1; }
+  100% { opacity: 0.8; }
+}
+
+.alert-active {
+  animation: alertPulse 1s ease-in-out infinite;
+}
+
+/* Video player custom styles */
+.video-container {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Webcam overlay */
+.webcam-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+
+/* Alert indicator */
+.alert-indicator {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  max-width: 300px;
+}
+
+/* Score indicator */
+.score-indicator {
+  background: linear-gradient(135deg, #1f2937 0%, #374151 100%);
+  border: 1px solid #4b5563;
+}
+
+/* Dashboard grid animations */
+.dashboard-card {
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+}
+
+.dashboard-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+/* Chart styling */
+.recharts-tooltip-content {
+  background: #1f2937 !important;
+  border: 1px solid #374151 !important;
+  border-radius: 8px !important;
+  color: #f3f4f6 !important;
+}
+
+/* Custom scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #374151;
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #6b7280;
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+
+/* Loading spinner */
+.loading-spinner {
+  border: 4px solid #374151;
+  border-top: 4px solid #3b82f6;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Status badges */
+.status-active {
+  background-color: #10b981;
+  color: #f0fdf4;
+}
+
+.status-paused {
+  background-color: #f59e0b;
+  color: #fefce8;
+}
+
+.status-completed {
+  background-color: #3b82f6;
+  color: #eff6ff;
+}
+
+/* Alert types */
+.alert-critical {
+  border-left-color: #ef4444;
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+.alert-warning {
+  border-left-color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.1);
+}
+
+.alert-info {
+  border-left-color: #3b82f6;
+  background-color: rgba(59, 130, 246, 0.1);
+}
+
+/* Video player controls */
+.video-controls {
+  background: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.7) 100%);
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .video-sidebar {
+    display: none;
+  }
+  
+  .video-container {
+    width: 100%;
+  }
+}
+
+/* Focus indicators */
+.focus-ring:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+/* Glassmorphism effect */
+.glass-effect {
+  background: rgba(31, 41, 55, 0.8);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(75, 85, 99, 0.3);
+}
+
+/* Button hover effects */
+.btn-hover-effect {
+  position: relative;
+  overflow: hidden;
+}
+
+.btn-hover-effect::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  transition: left 0.5s;
+}
+
+.btn-hover-effect:hover::before {
+  left: 100%;
+}
