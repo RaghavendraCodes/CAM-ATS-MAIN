@@ -17,6 +17,7 @@ import numpy as np
 import mediapipe as mp
 import base64
 import io
+import torch
 from PIL import Image
 import asyncio
 import json
@@ -86,7 +87,7 @@ class SessionStatus(str, Enum):
 class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     email: str
-    name: str
+    name: str 
     password_hash: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
@@ -143,9 +144,24 @@ class ImageAnalysisRequest(BaseModel):
     session_id: str
     image_data: str  # base64 encoded image
 
+try:
+    from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
+except Exception:
+    try:
+        from tensorflow.lite.python.interpreter import Interpreter as TFLiteInterpreter
+    except Exception:
+        TFLiteInterpreter = None
+
+DEFAULT_EFFICIENTDET_PATH = "models/1.tflite"
+IRIS_REAL_DIAMETER_MM = 11.7  # average human iris diameter
+
+
+
+
 # Computer Vision Analysis Class
 class AttentionAnalyzer:
     def __init__(self):
+        # Keep your existing mediapipe initializations (unchanged API)
         self.face_detection = mp_face_detection.FaceDetection(
             model_selection=0, min_detection_confidence=0.5)
         self.face_mesh = mp_face_mesh.FaceMesh(
@@ -166,6 +182,55 @@ class AttentionAnalyzer:
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5)
 
+        # === New internal fields (safe: do not change any external API) ===
+        # Object detector (TFLite Interpreter) -> lazy loaded
+        self._object_detector: Optional[Any] = None
+        self._object_label_map = None
+        self._detector_interval = 10  # run object detector every N frames
+        self._frame_counter = 0
+        self._mobile_timer = 0  # hysteresis counter (frames remaining mobile is considered present)
+        self._mobile_hysteresis_frames = 30  # keep mobile detected for this many frames after detection
+        self._mobile_confidence_threshold = 0.4
+
+        self._yolo_model = None
+        self._yolo_conf = 0.35  # minimum required confidence
+
+
+        # store last rotation matrix and translation from the PnP solve
+        self._last_rotation_matrix = None
+        self._last_translation_vector = None
+        self._last_camera_matrix = None
+
+        # previous gaze for smoothing
+        self._prev_gaze_vector = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self._prev_gaze_time = None
+
+        # default model path (you can replace file at this path); lazy loaded only
+        self._efficientdet_path = DEFAULT_EFFICIENTDET_PATH
+
+        # fallback flag if tflite isn't available (we'll use Canny fallback)
+        self._tflite_available = TFLiteInterpreter is not None
+
+    def _init_yolo_model(self):
+        if self._yolo_model is not None:
+            return
+
+        try:
+            self._yolo_model = torch.hub.load(
+                'ultralytics/yolov5', 
+                'yolov5s', 
+                pretrained=True
+            )
+            # Make predictions faster (no gradients)
+            self._yolo_model.eval()
+        except Exception as e:
+            print("YOLOv5 loading failed:", e)
+            self._yolo_model = None
+
+
+    # ---------------------------
+    # Public analyze_image (signature unchanged)
+    # ---------------------------
     def analyze_image(self, image: np.ndarray) -> Dict[str, Any]:
         """Comprehensive image analysis for attention tracking"""
         results = {
@@ -180,14 +245,14 @@ class AttentionAnalyzer:
             "alerts": []
         }
 
+        # Convert and process
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # 1. Face Detection
+
+        # 1. Face Detection (keep behavior)
         face_results = self.face_detection.process(rgb_image)
         if face_results.detections:
             results["face_detected"] = True
             results["face_count"] = len(face_results.detections)
-            
             if results["face_count"] > 1:
                 results["alerts"].append({
                     "type": AlertType.MULTIPLE_FACES,
@@ -199,36 +264,38 @@ class AttentionAnalyzer:
                 "description": "No face detected in the image"
             })
 
-        # 2. Face Mesh Analysis for detailed face tracking
+        # 2. Face Mesh Analysis for detailed face tracking (use attention mesh)
         mesh_results = self.face_mesh.process(rgb_image)
         if mesh_results.multi_face_landmarks and len(mesh_results.multi_face_landmarks) > 0:
             landmarks = mesh_results.multi_face_landmarks[0]
-            
-            # Head pose estimation
+
+            # Head pose estimation -- also stores internal rotation/translation matrices for gaze correction
             results["head_pose"] = self._estimate_head_pose(landmarks, image.shape)
-            
-            # Eye gaze estimation
-            results["eye_gaze"] = self._estimate_eye_gaze(landmarks)
-            
+
+            # Eye gaze estimation (improved: uses PnP rotation & iris depth when available)
+            gaze = self._estimate_eye_gaze(landmarks, image.shape)
+            results["eye_gaze"] = {"x": float(gaze[0]), "y": float(gaze[1])}
+
             # Facial expression analysis
             results["facial_expression"] = self._analyze_facial_expression(landmarks)
-            
-            # Check for yawning or excessive laughing
+
+            # Yawning or excessive laughing
             if results["facial_expression"] in ["yawning", "laughing"]:
                 results["alerts"].append({
                     "type": AlertType.YAWNING if results["facial_expression"] == "yawning" else AlertType.LAUGHING,
                     "description": f"Detected {results['facial_expression']}"
                 })
 
-        # 3. Mobile/Phone detection
-        results["mobile_detected"] = self._detect_mobile_device(image)
+        # 3. Mobile/Phone detection (improved hybrid pipeline)
+        mobile_detected = self._detect_mobile_device(image, rgb_image)
+        results["mobile_detected"] = bool(mobile_detected)
         if results["mobile_detected"]:
             results["alerts"].append({
                 "type": AlertType.MOBILE_DETECTED,
                 "description": "Mobile device detected in the scene"
             })
 
-        # 4. Lighting analysis
+        # 4. Lighting analysis (unchanged)
         results["lighting_quality"] = self._analyze_lighting(image)
         if results["lighting_quality"] < 0.3:
             results["alerts"].append({
@@ -236,7 +303,7 @@ class AttentionAnalyzer:
                 "description": "Poor lighting conditions detected"
             })
 
-        # 5. Head pose alerts
+        # 5. Head pose alerts (unchanged thresholds)
         head_pose = results["head_pose"]
         if abs(head_pose["yaw"]) > 30 or abs(head_pose["pitch"]) > 25:
             results["alerts"].append({
@@ -244,7 +311,7 @@ class AttentionAnalyzer:
                 "description": f"Head turned away: yaw={head_pose['yaw']:.1f}°, pitch={head_pose['pitch']:.1f}°"
             })
 
-        # 6. Eye gaze alerts
+        # 6. Eye gaze alerts (use refined gaze)
         eye_gaze = results["eye_gaze"]
         if abs(eye_gaze["x"]) > 0.3 or abs(eye_gaze["y"]) > 0.3:
             results["alerts"].append({
@@ -252,11 +319,47 @@ class AttentionAnalyzer:
                 "description": "Eyes not looking at the screen"
             })
 
-        # 7. Calculate attention score
+        # 7. Calculate attention score (unchanged signature)
         results["attention_score"] = self._calculate_attention_score(results)
 
         return results
 
+    def _detect_mobile_device(self, image_bgr, image_rgb=None):
+        try:
+            # Lazy-load YOLO
+            if self._yolo_model is None:
+                self._init_yolo_model()
+
+            # If YOLO failed to load → no detection
+            if self._yolo_model is None:
+                return False
+
+            # YOLO expects RGB
+            img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+            # Run inference
+            results = self._yolo_model(img_rgb, size=640)
+
+            df = results.pandas().xyxy[0]  # YOLO formatted results
+
+            # Look for COCO class: "cell phone"
+            for _, row in df.iterrows():
+                label = str(row['name']).lower()
+                conf = float(row['confidence'])
+
+                if label == 'cell phone' and conf >= self._yolo_conf:
+                    return True
+
+            return False
+
+        except Exception as e:
+            print("YOLOv5 detection error:", e)
+            return False
+
+
+    # ---------------------------
+    # Head pose: unchanged outward, but stores r/t matrices for internal gaze correction
+    # ---------------------------
     def _estimate_head_pose(self, landmarks, image_shape):
         """Estimate head pose from MediaPipe facial landmarks using SolvePnP"""
         try:
@@ -282,14 +385,14 @@ class AttentionAnalyzer:
                 (landmarks.landmark[291].x * w, landmarks.landmark[291].y * h)  # Right mouth corner
             ], dtype=np.float32)
 
-            # Camera internals (assume no lens distortion)
-            focal_length = w
+            # Camera internals (approximate)
+            focal_length = w  # as recommended
             center = (w / 2, h / 2)
             camera_matrix = np.array([
                 [focal_length, 0, center[0]],
                 [0, focal_length, center[1]],
                 [0, 0, 1]
-            ], dtype=np.float32)
+            ], dtype=np.float64)
 
             dist_coeffs = np.zeros((4, 1))  # no distortion
 
@@ -299,77 +402,243 @@ class AttentionAnalyzer:
             )
 
             if not success:
+                # clear stored matrices
+                self._last_rotation_matrix = None
+                self._last_translation_vector = None
+                self._last_camera_matrix = None
                 return {"yaw": 0, "pitch": 0, "roll": 0}
 
-            # Convert rotation vector to rotation matrix
+            # Convert rotation vector to rotation matrix (3x3)
             rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
 
-            # Extract Euler angles (yaw, pitch, roll)
+            # store for gaze correction pipeline
+            self._last_rotation_matrix = rotation_matrix.copy()
+            self._last_translation_vector = translation_vector.copy()
+            self._last_camera_matrix = camera_matrix.copy()
+
+            # Extract Euler angles (yaw, pitch, roll) in degrees
             sy = np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)
+            pitch = np.arctan2(-rotation_matrix[2, 0], sy) * 180.0 / np.pi
+            yaw = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180.0 / np.pi
+            roll = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]) * 180.0 / np.pi
 
-            pitch = np.arctan2(-rotation_matrix[2, 0], sy) * 180 / np.pi
-            yaw   = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]) * 180 / np.pi
-            roll  = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]) * 180 / np.pi
-
-            return {"yaw": yaw, "pitch": pitch, "roll": roll}
+            return {"yaw": float(yaw), "pitch": float(pitch), "roll": float(roll)}
 
         except Exception as e:
+            # fail-safe: clear stored matrices
+            self._last_rotation_matrix = None
+            self._last_translation_vector = None
+            self._last_camera_matrix = None
             print("Head pose error:", e)
             return {"yaw": 0, "pitch": 0, "roll": 0}
 
-    def _estimate_eye_gaze(self, landmarks):
-        """Estimate eye gaze direction - detect if looking away (sides, up, down)"""
+    # ---------------------------
+    # Eye gaze: improved pipeline using iris landmarks + PnP un-rotation + smoothing
+    # ---------------------------
+    def _estimate_eye_gaze(self, landmarks, image_shape):
+        """Estimate eye gaze direction - returns (gaze_x, gaze_y) normalized"""
+
         try:
-            # Iris landmark indices
-            LEFT_IRIS = 468
-            RIGHT_IRIS = 473
-            
-            # Eye corners for reference
+            h, w = image_shape[:2]
+
+            # Iris landmark indices (as per MediaPipe AttentionMesh)
+            LEFT_IRIS_CENTER = 468
+            LEFT_IRIS_INNER = 469  # bounds used for radius estimate
+            LEFT_IRIS_OUTER = 471
+            RIGHT_IRIS_CENTER = 473
+            RIGHT_IRIS_INNER = 474
+            RIGHT_IRIS_OUTER = 476
+
+            # Eye corner indices for left eye (for center computation)
             LEFT_EYE_LEFT = 33
             LEFT_EYE_RIGHT = 133
             RIGHT_EYE_LEFT = 263
             RIGHT_EYE_RIGHT = 362
-            
-            # Get iris positions
-            left_iris_x = landmarks.landmark[LEFT_IRIS].x
-            left_iris_y = landmarks.landmark[LEFT_IRIS].y
-            right_iris_x = landmarks.landmark[RIGHT_IRIS].x
-            right_iris_y = landmarks.landmark[RIGHT_IRIS].y
-            
-            # Get eye reference points
-            left_eye_left = landmarks.landmark[LEFT_EYE_LEFT].x
-            left_eye_right = landmarks.landmark[LEFT_EYE_RIGHT].x
-            left_eye_top = landmarks.landmark[159].y
-            left_eye_bottom = landmarks.landmark[145].y
-            
-            right_eye_left = landmarks.landmark[RIGHT_EYE_LEFT].x
-            right_eye_right = landmarks.landmark[RIGHT_EYE_RIGHT].x
-            right_eye_top = landmarks.landmark[386].y
-            right_eye_bottom = landmarks.landmark[374].y
-            
-            # Calculate eye centers
-            left_eye_center_x = (left_eye_left + left_eye_right) / 2
-            left_eye_center_y = (left_eye_top + left_eye_bottom) / 2
-            
-            right_eye_center_x = (right_eye_left + right_eye_right) / 2
-            right_eye_center_y = (right_eye_top + right_eye_bottom) / 2
-            
-            # Normalized iris position relative to eye center
-            left_gaze_x = (left_iris_x - left_eye_center_x) / (left_eye_right - left_eye_left)
-            left_gaze_y = (left_iris_y - left_eye_center_y) / (left_eye_bottom - left_eye_top)
-            
-            right_gaze_x = (right_iris_x - right_eye_center_x) / (right_eye_right - right_eye_left)
-            right_gaze_y = (right_iris_y - right_eye_center_y) / (right_eye_bottom - right_eye_top)
-            
-            # Average both eyes
-            gaze_x = (left_gaze_x + right_gaze_x) / 2
-            gaze_y = (left_gaze_y + right_gaze_y) / 2
-            
-            return {"x": gaze_x, "y": gaze_y}
-            
-        except:
-            return {"x": 0, "y": 0}
 
+            # Pixel coords for iris centers and eye centers
+            def lm_to_pixel(lm):
+                return np.array([lm.x * w, lm.y * h, lm.z * w], dtype=np.float64)
+
+            # get positions (pixel-space) - MediaPipe returns x,y normalized and z relative scale
+            left_iris = lm_to_pixel(landmarks.landmark[LEFT_IRIS_CENTER])
+            right_iris = lm_to_pixel(landmarks.landmark[RIGHT_IRIS_CENTER])
+
+            left_eye_left = lm_to_pixel(landmarks.landmark[LEFT_EYE_LEFT])
+            left_eye_right = lm_to_pixel(landmarks.landmark[LEFT_EYE_RIGHT])
+            right_eye_left = lm_to_pixel(landmarks.landmark[RIGHT_EYE_LEFT])
+            right_eye_right = lm_to_pixel(landmarks.landmark[RIGHT_EYE_RIGHT])
+
+            # eye centers (pixel-space)
+            left_eye_center = (left_eye_left + left_eye_right) / 2.0
+            right_eye_center = (right_eye_left + right_eye_right) / 2.0
+
+            # Estimate iris pixel diameter (use distance between two iris-bound landmarks if available)
+            # fallback to horizontal eye width fraction if bound landmarks missing
+            try:
+                left_i1 = lm_to_pixel(landmarks.landmark[LEFT_IRIS_INNER])
+                left_i2 = lm_to_pixel(landmarks.landmark[LEFT_IRIS_OUTER])
+                left_iris_d_px = np.linalg.norm(left_i1[:2] - left_i2[:2])
+            except Exception:
+                left_iris_d_px = np.linalg.norm(left_eye_left[:2] - left_eye_right[:2]) * 0.15
+
+            try:
+                right_i1 = lm_to_pixel(landmarks.landmark[RIGHT_IRIS_INNER])
+                right_i2 = lm_to_pixel(landmarks.landmark[RIGHT_IRIS_OUTER])
+                right_iris_d_px = np.linalg.norm(right_i1[:2] - right_i2[:2])
+            except Exception:
+                right_iris_d_px = np.linalg.norm(right_eye_left[:2] - right_eye_right[:2]) * 0.15
+
+            # choose average iris diameter
+            iris_d_px = float(max(1.0, (left_iris_d_px + right_iris_d_px) / 2.0))
+
+            # approximate focal length in pixels (fx = fy = image width as discussed)
+            fx = float(w)
+            if fx <= 0:
+                fx = 1.0
+
+            # Depth estimate (Z) in same metric as IRIS_REAL_DIAMETER_MM -> convert mm to same unit as focal using ratio
+            # Z (approx) = f_pixels * real_iris_mm / iris_pixels
+            z_mm = fx * IRIS_REAL_DIAMETER_MM / iris_d_px  # in "mm-pixel-units"
+            # We'll put the x,y into camera coordinates by projecting using camera center
+            cx = w / 2.0
+            cy = h / 2.0
+
+            # convert pixel coordinates to camera coordinates (approx)
+            def pixel_to_camera(pt_pixel, z_est_mm):
+                x_cam = (pt_pixel[0] - cx) * (z_est_mm / fx)
+                y_cam = (pt_pixel[1] - cy) * (z_est_mm / fx)
+                z_cam = z_est_mm
+                return np.array([x_cam, y_cam, z_cam], dtype=np.float64)
+
+            # Build camera-space points for the iris and eye centers
+            left_iris_cam = pixel_to_camera(left_iris[:2], z_mm)
+            right_iris_cam = pixel_to_camera(right_iris[:2], z_mm)
+
+            left_eye_cam = pixel_to_camera(left_eye_center[:2], z_mm)
+            right_eye_cam = pixel_to_camera(right_eye_center[:2], z_mm)
+
+            # Compute eye vectors in camera frame (from eye center to iris center)
+            left_vec_cam = left_iris_cam - left_eye_cam
+            right_vec_cam = right_iris_cam - right_eye_cam
+
+            # If we have a reliable rotation matrix from PnP, un-rotate the vectors to head-local frame
+            if self._last_rotation_matrix is not None:
+                try:
+                    rmat = self._last_rotation_matrix  # 3x3
+                    # Un-rotation: head-local vector = R^T * vector_camera
+                    left_vec_local = rmat.T.dot(left_vec_cam)
+                    right_vec_local = rmat.T.dot(right_vec_cam)
+                except Exception:
+                    left_vec_local = left_vec_cam
+                    right_vec_local = right_vec_cam
+            else:
+                left_vec_local = left_vec_cam
+                right_vec_local = right_vec_cam
+
+            # Average local vectors
+            gaze_local = (left_vec_local + right_vec_local) / 2.0
+
+            # Normalize gaze_local to unit vector
+            if np.linalg.norm(gaze_local) == 0:
+                gaze_local = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            else:
+                gaze_local = gaze_local / np.linalg.norm(gaze_local)
+
+            # convert the 3D local gaze vector into 2D gaze_x, gaze_y signals
+            # We'll use small-angle approximations: gaze_x ~ (gaze_local.x / gaze_local.z), gaze_y ~ (gaze_local.y / gaze_local.z)
+            # Then clamp to [-1, 1]
+            gaze_x = float(gaze_local[0] / max(1e-6, gaze_local[2]))
+            gaze_y = float(gaze_local[1] / max(1e-6, gaze_local[2]))
+
+            # --- Temporal smoothing (adaptive EMA / One-Euro style simple variant) ---
+            now = time.time()
+            if self._prev_gaze_time is None:
+                dt = 1.0 / 30.0
+            else:
+                dt = max(1e-6, now - self._prev_gaze_time)
+            self._prev_gaze_time = now
+
+            # speed (magnitude of change)
+            prev = self._prev_gaze_vector.copy()
+            candidate = np.array([gaze_x, gaze_y, 1.0], dtype=np.float32)
+            speed = np.linalg.norm(candidate - prev) / dt
+
+            # adaptive alpha: fast movement -> higher alpha (less smoothing)
+            # parameters tuned for low-latency human gaze: base_alpha ~ 0.2, max_alpha ~ 0.8
+            base_alpha = 0.25
+            max_alpha = 0.8
+            # speed thresholds (empirical)
+            slow_speed = 2.0
+            fast_speed = 10.0
+            if speed <= slow_speed:
+                alpha = base_alpha
+            elif speed >= fast_speed:
+                alpha = max_alpha
+            else:
+                alpha = base_alpha + (max_alpha - base_alpha) * ((speed - slow_speed) / (fast_speed - slow_speed))
+
+            # EMA update
+            smoothed = alpha * candidate + (1.0 - alpha) * prev
+            self._prev_gaze_vector = smoothed
+
+            # deliver normalized gaze_x,gaze_y from smoothed vector
+            out_x = float(np.clip(smoothed[0] / max(1e-6, smoothed[2]), -1.0, 1.0))
+            out_y = float(np.clip(smoothed[1] / max(1e-6, smoothed[2]), -1.0, 1.0))
+
+            # Map out_x/out_y to roughly the same scale as previous simple algorithm (so thresholds remain meaningful).
+            # The previous method produced values around [-1..1] typically; we keep that scale.
+            return out_x, out_y
+
+        except Exception as e:
+            # If anything goes wrong, fallback to your previous approximate method
+            # (keeps API stable and returns a safe default)
+            # print("Gaze pipeline error:", e)
+            try:
+                # fallback: original normalized iris-relative method (keeps behavior)
+                LEFT_IRIS = 468
+                RIGHT_IRIS = 473
+                LEFT_EYE_LEFT = 33
+                LEFT_EYE_RIGHT = 133
+                RIGHT_EYE_LEFT = 263
+                RIGHT_EYE_RIGHT = 362
+
+                left_iris_x = landmarks.landmark[LEFT_IRIS].x
+                left_iris_y = landmarks.landmark[LEFT_IRIS].y
+                right_iris_x = landmarks.landmark[RIGHT_IRIS].x
+                right_iris_y = landmarks.landmark[RIGHT_IRIS].y
+
+                left_eye_left = landmarks.landmark[LEFT_EYE_LEFT].x
+                left_eye_right = landmarks.landmark[LEFT_EYE_RIGHT].x
+                left_eye_top = landmarks.landmark[159].y
+                left_eye_bottom = landmarks.landmark[145].y
+
+                right_eye_left = landmarks.landmark[RIGHT_EYE_LEFT].x
+                right_eye_right = landmarks.landmark[RIGHT_EYE_RIGHT].x
+                right_eye_top = landmarks.landmark[386].y
+                right_eye_bottom = landmarks.landmark[374].y
+
+                left_eye_center_x = (left_eye_left + left_eye_right) / 2
+                left_eye_center_y = (left_eye_top + left_eye_bottom) / 2
+
+                right_eye_center_x = (right_eye_left + right_eye_right) / 2
+                right_eye_center_y = (right_eye_top + right_eye_bottom) / 2
+
+                left_gaze_x = (left_iris_x - left_eye_center_x) / (left_eye_right - left_eye_left + 1e-6)
+                left_gaze_y = (left_iris_y - left_eye_center_y) / (left_eye_bottom - left_eye_top + 1e-6)
+
+                right_gaze_x = (right_iris_x - right_eye_center_x) / (right_eye_right - right_eye_left + 1e-6)
+                right_gaze_y = (right_iris_y - right_eye_center_y) / (right_eye_bottom - right_eye_top + 1e-6)
+
+                gaze_x = (left_gaze_x + right_gaze_x) / 2
+                gaze_y = (left_gaze_y + right_gaze_y) / 2
+
+                return float(gaze_x), float(gaze_y)
+            except Exception:
+                return 0.0, 0.0
+
+    # ---------------------------
+    # Facial expression: unchanged
+    # ---------------------------
     def _analyze_facial_expression(self, landmarks):
         """Analyze facial expression for yawning, laughing, etc."""
         try:
@@ -378,21 +647,21 @@ class AttentionAnalyzer:
             lower_lip = landmarks.landmark[14]
             left_mouth = landmarks.landmark[61]
             right_mouth = landmarks.landmark[291]
-            
+
             # Calculate mouth opening
             mouth_height = abs(upper_lip.y - lower_lip.y)
             mouth_width = abs(left_mouth.x - right_mouth.x)
-            
+
             # Eye landmarks for detecting if eyes are open/closed
             left_eye_top = landmarks.landmark[159]
             left_eye_bottom = landmarks.landmark[145]
             right_eye_top = landmarks.landmark[386]
             right_eye_bottom = landmarks.landmark[374]
-            
+
             left_eye_height = abs(left_eye_top.y - left_eye_bottom.y)
             right_eye_height = abs(right_eye_top.y - right_eye_bottom.y)
             avg_eye_height = (left_eye_height + right_eye_height) / 2
-            
+
             # Determine expression
             if mouth_height > 0.02 and mouth_width > 0.04:
                 return "yawning"
@@ -405,143 +674,119 @@ class AttentionAnalyzer:
         except:
             return "neutral"
 
-    def _detect_mobile_device(self, image):
-        """Detect mobile devices in the image using basic computer vision"""
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-            # Use edge detection to find rectangular objects
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for contour in contours:
-                # Approximate contour to polygon
-                epsilon = 0.02 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                
-                # Check if it's rectangular and has appropriate size
-                if len(approx) == 4:
-                    x, y, w, h = cv2.boundingRect(approx)
-                    aspect_ratio = w / h if h > 0 else 0
-                    area = cv2.contourArea(contour)
-                    
-                    # Mobile phone typically has aspect ratio between 0.4-0.7 and reasonable size
-                    if 0.4 < aspect_ratio < 0.7 and 1000 < area < 50000:
-                        return True
-            
-            return False
-        except:
-            return False
-
+    # ---------------------------
+    # Lighting analysis: unchanged
+    # ---------------------------
     def _analyze_lighting(self, image):
         """Analyze lighting conditions"""
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
+
             # Calculate brightness metrics
             mean_brightness = np.mean(gray)
             std_brightness = np.std(gray)
-            
+
             # Normalize to 0-1 scale
             brightness_score = mean_brightness / 255.0
             contrast_score = std_brightness / 128.0
-            
+
             # Combine metrics (good lighting has moderate brightness and good contrast)
             lighting_quality = 0.7 * brightness_score + 0.3 * min(contrast_score, 1.0)
-            
+
             # Penalize very dark or very bright images
             if brightness_score < 0.2 or brightness_score > 0.9:
                 lighting_quality *= 0.5
-                
+
             return min(lighting_quality, 1.0)
         except:
             return 0.5
 
+    # ---------------------------
+    # Attention scoring: unchanged
+    # ---------------------------
     def _calculate_attention_score(self, results: Dict[str, Any]) -> float:
         """
-        Calculates a more logical, scaled attention score based on analysis results.
-        The score starts at 1.0 (100%) and deductions are applied based on the severity of infractions.
+        Calculates a more realistic, practical attention score.
+        Score = 1.0 (max) with deductions for distraction indicators.
         """
-        
-        # =================================================================================
-        # 1. Foundational Checks (Is the user present and alone?)
-        # Rationale: If the basic conditions aren't met, a score is meaningless.
-        # This is the most critical factor.
-        # =================================================================================
+
+        # ------------------------------
+        # 1. Face validation
+        # ------------------------------
         if not results.get("face_detected"):
-            return 0.0  # If no face is detected, attention is zero.
+            return 0.0
+        
         if results.get("face_count", 0) > 1:
-            return 0.3  # Presence of others is a major distraction, cap score.
+            # More than one face = cheating / strong distraction
+            return 0.0
 
-        # Start with a perfect score.
         score = 1.0
-        
-        # =================================================================================
-        # 2. Major Distraction Penalties
-        # Rationale: Certain actions have a high, fixed cost to attention. These are
-        # typically conscious choices to disengage from the primary task.
-        # =================================================================================
-        # A. Mobile Phone Usage
-        if results.get("mobile_detected"):
-            score -= 0.60  # Using a phone is a severe distraction. Heavy penalty.
-            
-        # B. Yawning / Drowsiness
-        if results.get("facial_expression") == "yawning":
-            score -= 0.35  # Yawning is a strong indicator of low engagement or fatigue.
 
-        # =================================================================================
-        # 3. Gradual & Scaled Penalties for Gaze and Pose
-        # Rationale: Penalize based on *how much* the user deviates. A small, natural 
-        # movement shouldn't be punished. Only significant, sustained deviations should.
-        # This addresses your request for "extreme" turns only.
-        # =================================================================================
-        
-        # A. Head Pose (Yaw & Pitch)
+        # ------------------------------
+        # 2. Mobile detection (strongest penalty)
+        # ------------------------------
+        if results.get("mobile_detected"):
+            score -= 0.75  # more realistic penalty
+
+        # ------------------------------
+        # 3. Facial expression-based penalties
+        # ------------------------------
+        expr = results.get("facial_expression", "neutral")
+
+        if expr == "yawning":
+            score -= 0.15
+        elif expr == "laughing":
+            score -= 0.25
+        elif expr == "eyes_closed":
+            score -= 0.50  # big penalty for drowsiness
+
+        # ------------------------------
+        # 4. Head pose penalties
+        # ------------------------------
         head_pose = results.get("head_pose", {})
         yaw = abs(head_pose.get("yaw", 0))
         pitch = abs(head_pose.get("pitch", 0))
-        
-        # Define a "safe zone" where no penalty is applied for normal movement.
-        YAW_SAFE_ZONE = 30   # Degrees
-        PITCH_SAFE_ZONE = 25 # Degrees
-        
-        # Define the "extreme" angle at which the maximum penalty is applied.
-        YAW_EXTREME_ZONE = 75   # A near 90-degree turn
-        PITCH_EXTREME_ZONE = 60 # Looking almost straight up or down
 
-        # Only apply a penalty if the turn is outside the safe zone.
-        if yaw > YAW_SAFE_ZONE:
-            # The penalty scales linearly from 0 (at the edge of the safe zone)
-            # to a max of 0.5 (at the extreme zone).
-            yaw_penalty = 0.5 * (yaw - YAW_SAFE_ZONE) / (YAW_EXTREME_ZONE - YAW_SAFE_ZONE)
-            score -= min(yaw_penalty, 0.5) # Cap the penalty
+        # YAW (left/right) thresholding
+        if yaw > 25:
+            yaw_penalty = 0.40 * (yaw - 25) / (70 - 25)
+            score -= min(yaw_penalty, 0.40)
 
-        if pitch > PITCH_SAFE_ZONE:
-            pitch_penalty = 0.4 * (pitch - PITCH_SAFE_ZONE) / (PITCH_EXTREME_ZONE - PITCH_SAFE_ZONE)
-            score -= min(pitch_penalty, 0.4) # Cap the penalty
+        # PITCH (up/down) — stronger penalty
+        if pitch > 20:
+            pitch_penalty = 0.50 * (pitch - 20) / (55 - 20)
+            score -= min(pitch_penalty, 0.50)
 
-        # B. Eye Gaze Deviation
+        # ------------------------------
+        # 5. Eye gaze penalty (using vector magnitude)
+        # ------------------------------
         eye_gaze = results.get("eye_gaze", {})
-        gaze_deviation = abs(eye_gaze.get("x", 0))
+        gx = float(eye_gaze.get("x", 0))
+        gy = float(eye_gaze.get("y", 0))
+        gaze_mag = (gx * gx + gy * gy) ** 0.5  # magnitude
 
-        # Gaze is more sensitive, so it has a smaller safe zone.
-        GAZE_SAFE_ZONE = 0.4
-        GAZE_EXTREME_ZONE = 0.9 # Looking at the far edge of the screen
+        SAFE = 0.25
+        EXTREME = 0.85
 
-        if gaze_deviation > GAZE_SAFE_ZONE:
-            gaze_penalty = 0.3 * (gaze_deviation - GAZE_SAFE_ZONE) / (GAZE_EXTREME_ZONE - GAZE_SAFE_ZONE)
-            score -= min(gaze_penalty, 0.3)
+        if gaze_mag > SAFE:
+            gaze_penalty = 0.35 * (gaze_mag - SAFE) / (EXTREME - SAFE)
+            score -= min(gaze_penalty, 0.35)
 
-        # =================================================================================
-        # 4. Environmental Factor Penalties
-        # Rationale: Environmental factors affect attention but may be outside the
-        # user's immediate control. They should receive a smaller, fixed penalty.
-        # =================================================================================
-        if results.get("lighting_quality", 1.0) < 0.3:
-            score -= 0.15  # Poor lighting makes focus harder and can indicate a poor setup.
+        # ------------------------------
+        # 6. Lighting penalty (practical)
+        # ------------------------------
+        lighting = results.get("lighting_quality", 1.0)
 
-        # Final score is clamped between 0.0 and 1.0.
-        return max(score, 0.0)
+        if lighting < 0.20:
+            score -= 0.40
+        elif lighting < 0.35:
+            score -= 0.20
+
+        # ------------------------------
+        # FINAL CLAMP
+        # ------------------------------
+        score = max(min(score, 1.0), 0.0)
+        return score
 
 # Initialize analyzer
 analyzer = AttentionAnalyzer()

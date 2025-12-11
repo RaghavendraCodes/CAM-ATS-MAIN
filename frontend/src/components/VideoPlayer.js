@@ -66,7 +66,7 @@ const fetchTranscript = async (url) => {
   try {
     console.log("🔄 Fetching transcript for:", url);
 
-    const response = await axios.post(`/transcript`, { 
+    const response = await axios.post(`/api/transcript`, { 
       video_url: url 
     });
 
@@ -248,7 +248,7 @@ const fetchSession = async () => {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
-      {/* Header */}
+      {/* Header */}  
         <div className="flex items-center space-x-4 ml-5 justify-items-end">
             {/* NEW AI ASSISTANT BUTTON */}
             <button
