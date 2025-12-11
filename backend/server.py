@@ -912,6 +912,30 @@ async def get_session(session_id: str, current_user: User = Depends(get_current_
         raise HTTPException(status_code=404, detail="Session not found")
     return Session(**session)
 
+@api_router.post("/sessions/{session_id}/tab-switch")
+async def report_tab_switch(session_id: str, current_user: User = Depends(get_current_user)):
+    """Record a tab-switch alert for an active session."""
+    # Make sure the session exists and is active for this user
+    session = await db.sessions.find_one({
+        "id": session_id,
+        "user_id": current_user.id,
+        "status": SessionStatus.ACTIVE,
+    })
+    if not session:
+        raise HTTPException(status_code=404, detail="Active session not found")
+
+    alert = Alert(
+        session_id=session_id,
+        user_id=current_user.id,
+        alert_type=AlertType.TAB_SWITCH,
+        description="User switched to another tab/window",
+        confidence=1.0,
+        score_deduction=1,  # not used directly if you have custom scoring
+    )
+
+    await db.alerts.insert_one(alert.dict())
+    return {"message": "Tab switch recorded", "alert_id": alert.id}
+
 @api_router.post("/sessions/{session_id}/end")
 async def end_session(session_id: str, current_user: User = Depends(get_current_user)):
     """End a learning session"""
@@ -1100,7 +1124,10 @@ async def get_dashboard_data(current_user: User = Depends(get_current_user)):
     
     return {
         "user": {"id": current_user.id, "name": current_user.name, "email": current_user.email},
-        "recent_sessions": [Session(**session).dict() for session in recent_sessions],
+        "recent_sessions": [
+            Session(**{**session, "total_score": int(session.get("total_score", 0))}).dict()
+            for session in recent_sessions
+        ],
         "statistics": {
             "total_sessions": total_sessions,
             "total_alerts": total_alerts,
@@ -1155,7 +1182,7 @@ def fetch_transcript(video_id: str):
         print("Error while fetching transcript:", e)
         return None
 
-@api_router.post("/transcript")
+@api_router.post("/api/transcript")
 async def get_transcript(request: Request):
     data = await request.json()
     video_url = data.get("video_url")

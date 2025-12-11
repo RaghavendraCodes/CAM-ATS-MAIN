@@ -41,18 +41,30 @@ const VideoPlayer = ({ user }) => {
   const [videoTranscript, setVideoTranscript] = useState(null);
   const [isTranscriptLoading, setIsTranscriptLoading] = useState(false); // New loading state for the AI button
 
+  const isRecordingRef = useRef(false);
+
   useEffect(() => {
-    fetchSession();
-    setupVisibilityDetection();
-    
-    // Cleanup on unmount
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [sessionId]);
+  isRecordingRef.current = isRecording;
+}, [isRecording]);
+
+useEffect(() => {
+  fetchSession();
+  setupVisibilityDetection();
+
+  const handleVisibilityChange = () => {
+    if (document.hidden && isRecordingRef.current) {
+      reportTabSwitch();  // non-blocking now
+    }
+  };
+
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+
+  return () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+  };
+}, [sessionId]);
+
   
 const fetchTranscript = async (url) => {
   if (!url) {
@@ -119,7 +131,7 @@ const fetchSession = async () => {
 
   const reportTabSwitch = async () => {
     try {
-      await axios.post(`/sessions/${sessionId}/tab-switch`);
+      axios.post(`/sessions/${sessionId}/tab-switch`);
       addAlert({
         type: "tab_switch",
         description: "Tab switching detected - stay focused!",
