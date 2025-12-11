@@ -110,7 +110,7 @@ class Session(BaseModel):
     end_time: Optional[datetime] = None
     duration: Optional[int] = None  # in seconds
     status: SessionStatus = SessionStatus.ACTIVE
-    total_score: int = 100
+    total_score: float = 100
     alerts_count: int = 0
     description: Optional[str] = None
 
@@ -938,7 +938,7 @@ async def report_tab_switch(session_id: str, current_user: User = Depends(get_cu
 
 @api_router.post("/sessions/{session_id}/end")
 async def end_session(session_id: str, current_user: User = Depends(get_current_user)):
-    """End a learning session"""
+    """End a learning session with slow, per-alert score reduction."""
     session = await db.sessions.find_one({"id": session_id, "user_id": current_user.id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -946,14 +946,45 @@ async def end_session(session_id: str, current_user: User = Depends(get_current_
     end_time = datetime.utcnow()
     start_time = session["start_time"]
     duration = int((end_time - start_time).total_seconds())
-    
-    # Calculate final score based on alerts
-    alerts_count = await db.alerts.count_documents({"session_id": session_id})
-    final_score = max(100 - (alerts_count * 5), 0)
-    
-    # Generate session description
-    description = f"Session completed with {alerts_count} alerts and final score of {final_score}/100"
-    
+
+    # Fetch all alerts for this session
+    alerts = await db.alerts.find({"session_id": session_id}).to_list(10000)
+
+    # Base score
+    score = 100.0
+
+    # Per-alert penalties (tune these as you like)
+    # Mobile: strongest penalty; others smaller so score reduces slowly
+    penalties = {
+        AlertType.MOBILE_DETECTED.value: 1.0,     # mobile detected
+        AlertType.TAB_SWITCH.value: 0.8,          # tab switch
+        AlertType.MULTIPLE_FACES.value: 0.8,      # multiple faces
+        AlertType.NO_FACE_DETECTED.value: 0.8,    # no face
+        AlertType.HEAD_POSE_DEVIATION.value: 0.5, # head pose deviation
+        AlertType.EYE_GAZE_DEVIATION.value: 0.5,  # gaze deviation
+        AlertType.POOR_LIGHTING.value: 0.3,       # poor lighting
+        AlertType.YAWNING.value: 0.3,             # yawning
+        AlertType.LAUGHING.value: 0.3,            # laughing
+        AlertType.NOT_FOCUSED.value: 0.5,         # generic not focused
+        # LOUD_SOUND or others can be added here
+    }
+
+    total_deduction = 0.0
+
+    for alert in alerts:
+        alert_type = alert.get("alert_type")
+        penalty = penalties.get(alert_type, 0.2)  # default small penalty for unknown types
+        total_deduction += penalty
+
+    # Apply total deduction but keep score within [0, 100]
+    final_score = max(0.0, score - total_deduction)
+
+    alerts_count = len(alerts)
+    description = (
+        f"Session completed with {alerts_count} alerts and final score of "
+        f"{final_score:.1f}/100"
+    )
+
     await db.sessions.update_one(
         {"id": session_id},
         {
@@ -963,12 +994,17 @@ async def end_session(session_id: str, current_user: User = Depends(get_current_
                 "status": SessionStatus.COMPLETED,
                 "total_score": final_score,
                 "alerts_count": alerts_count,
-                "description": description
+                "description": description,
             }
         }
     )
-    
-    return {"message": "Session ended successfully", "final_score": final_score}
+
+    return {
+        "message": "Session ended successfully",
+        "final_score": final_score,
+        "alerts_count": alerts_count,
+        "total_deduction": total_deduction,
+    }
 
 @api_router.post("/analyze/image")
 async def analyze_image(request: ImageAnalysisRequest, current_user: User = Depends(get_current_user)):
